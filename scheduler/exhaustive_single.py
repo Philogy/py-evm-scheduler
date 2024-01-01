@@ -1,8 +1,7 @@
 from typing import Generator, NamedTuple, Optional, TypeVar
-from .node import Node
-
-
-Stack = tuple[Node, ...]
+from collections import defaultdict
+from .stack import Stack
+from .node import Node, has_dep
 
 
 def weight_of(schedule: tuple[str, ...]) -> int:
@@ -26,20 +25,23 @@ class SearchResult:
     best: Optional[int]
     schedule: Optional[tuple[str, ...]]
 
-    def __init__(self):
-        self.best = None
+    def __init__(self, target_weight: Optional[int]):
+        self.best = target_weight
         self.schedule = None
 
     def record_new(self, schedule: tuple[str, ...]):
-        weight = weight_of(schedule)
-        if self.best is None or weight < self.best:
-            self.best = weight
+        if self.is_candidate(schedule):
+            print(
+                f'found: {" ".join(s.split(" ", 1)[0] for s in schedule[::-1])}'
+            )
+            self.best = weight_of(schedule)
             self.schedule = schedule
 
-    def not_candidate(self, schedule: tuple[str, ...]) -> bool:
+    def is_candidate(self, schedule: tuple[str, ...]) -> bool:
+        weight = weight_of(schedule)
         if self.best is None:
-            return False
-        return weight_of(schedule) >= self.best
+            return True
+        return weight < self.best
 
 
 class ScheduleState(NamedTuple(
@@ -63,7 +65,7 @@ def remove(tup: tuple[T, ...], i: int) -> tuple[T, ...]:
 
 def undo_onto_stack(stack: Stack, node: Node) -> Stack:
     for operand in node.operands[::-1]:
-        stack += operand,
+        stack = stack.push(operand)
     return stack
 
 
@@ -71,14 +73,16 @@ StateTrans = Optional[tuple[ScheduleState, str]]
 
 
 def undo_top(state: ScheduleState) -> StateTrans:
-    top = state.stack[-1]
-    if any(value.has_dep(top) for value in state.stack[:-1]):
+    top, new_stack = state.stack.pop()
+    if any(has_dep(value, top) for value in state.stack.values[:-1])\
+            or any(has_dep(effect, top) for effect in state.effects):
         return None
-    new_stack = undo_onto_stack(state.stack[:-1], top)
+    # print(f'undoing {top} ...')
+    new_stack = undo_onto_stack(new_stack, top)
     return state.set_stack(new_stack), f'{top.name}'
 
 
-def undo_effect(state: ScheduleState, effect_index: int) -> tuple[ScheduleState, str]:
+def undo_effect(state: ScheduleState, effect_index: int) -> StateTrans:
     assert effect_index in range(len(state.effects))
     effect = state.effects[effect_index]
     new_stack = undo_onto_stack(state.stack, effect)
@@ -87,25 +91,29 @@ def undo_effect(state: ScheduleState, effect_index: int) -> tuple[ScheduleState,
 
 def dedup_top(state: ScheduleState, rev_index: int) -> tuple[ScheduleState, str]:
     depth = len(state.stack) - rev_index - 1
-    return state.set_stack(state.stack[:-1]), f'dup{depth}'
+    _, new_stack = state.stack.pop()
+    return state.set_stack(new_stack), f'dup{depth}'
 
 
 def swap(state: ScheduleState, depth: int) -> StateTrans:
-    new_stack = list(state.stack)
-    new_stack[-1], new_stack[-depth-1] = new_stack[-depth-1], new_stack[-1]
-    return state.set_stack(tuple(new_stack)), f'swap{depth}'
+    return state.set_stack(state.stack.swap(depth)), f'swap{depth}'
 
 
-def get_backwards_paths(state: ScheduleState) -> Generator[StateTrans, None, None]:
+def get_backwards_paths(entry_point: ScheduleState, state: ScheduleState) -> Generator[StateTrans, None, None]:
     for i, _ in enumerate(state.effects):
         yield undo_effect(state, i)
     if len(state.stack) > 0:
-        yield undo_top(state)
-        top = state.stack[-1]
-        for i, el in enumerate(state.stack[:-1]):
+        top = state.stack.values[-1]
+        if top not in entry_point.stack.values:
+            yield undo_top(state)
+        for i, el in enumerate(state.stack.values[:-1]):
             if el == top:
                 yield dedup_top(state, i)
+    # print(f'\nstate.stack:')
+    # for v in state.stack.values[::-1]:
+    #     print(f'    {v}')
     for depth in range(1, len(state.stack)):
+        # print(f'swap{depth}')
         yield swap(state, depth)
 
 
@@ -114,39 +122,69 @@ def traverse_backwards(
     already_traversed: frozenset[ScheduleState],
     entry_point: ScheduleState,
     current: ScheduleState,
-    ops: tuple[str, ...]
+    ops: tuple[str, ...],
+    verbose: bool,
+    depth: int
 ):
-    if result.not_candidate(ops) or current in already_traversed:
+    # assert len(ops) < 20
+    # print(f'\nstack: {current.stack}')
+    # for op in ops[::-1]:
+    #     print(op)
+    padding = ' ' * (2 * depth)
+    if not result.is_candidate(ops):
+        if verbose:
+            print(f'{padding}=> not candidate')
+        return
+    if current in already_traversed:
+        if verbose:
+            print(f'{padding}=> already traversed')
         return
     if current == entry_point:
+        if verbose:
+            print(f'{padding}=> W rizz ({weight_of(ops)})')
         result.record_new(ops)
         return
-    for transition in get_backwards_paths(current):
+    # if not current.effects and has_elements()
+    new_traversed = already_traversed | frozenset({current})
+    for transition in get_backwards_paths(entry_point, current):
         if transition is not None:
             new_state, new_op = transition
+            if verbose:
+                print(
+                    padding
+                    + f'└--------> {new_op} => {new_state.stack}'
+                )
             traverse_backwards(
                 result,
-                already_traversed | frozenset({current}),
+                new_traversed,
                 entry_point,
                 new_state,
-                ops + (new_op + ' ' + str(current.stack),)
+                ops + (new_op + ' ' + str(current.stack),),
+                verbose,
+                depth + 1
             )
 
 
 def schedule_exhaustive_single(
     stack_in: tuple[Node, ...],
     stack_out: tuple[Node, ...],
-    effects: tuple[Node, ...]
+    effects: tuple[Node, ...],
+    target_weight: Optional[int] = None,
+    verbose: bool = False
 ) -> tuple[str, ...]:
-    start = ScheduleState(stack_in, tuple())
-    goal = ScheduleState(stack_out, effects)
-    result = SearchResult()
+    start = ScheduleState(Stack(stack_in), tuple())
+    goal = ScheduleState(Stack(stack_out), effects)
+    result = SearchResult(target_weight)
+    if verbose:
+        print(goal.stack)
     traverse_backwards(
         result,
         frozenset(),
         start,
         goal,
-        tuple()
+        tuple(),
+        verbose=verbose,
+        depth=0
     )
     assert result.schedule is not None
     return result.schedule[::-1]

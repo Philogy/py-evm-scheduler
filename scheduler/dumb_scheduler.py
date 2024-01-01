@@ -1,21 +1,22 @@
-from .node import Node
+from .node import Block, Value
+from .stack import Stack
 from collections import defaultdict
 
 
-def count_nodes(count: dict[Node, int], nodes: tuple[Node, ...]):
-    for node in nodes:
-        count[node] += 1
-        count_nodes(count, node.operands)
+def schedule_dumb(block: Block) -> tuple[str, ...]:
+    dependent_count = block.get_dependent_count()
+    last_steps: set[int] = {
+        sid
+        for sid in range(len(block.steps))
+        if dependent_count[sid] == 0
+    }
+    rem_instances = defaultdict(int)
+    schedule: tuple[str, ...] = tuple()
 
+    stack: Stack = Stack(block.stack_out)
 
-def schedule_dumb(
-    stack_in: tuple[Node, ...],
-    stack_out: tuple[Node, ...],
-    effects: tuple[Node, ...]
-) -> tuple[str, ...]:
-    count: dict[Node, int] = defaultdict(int)
-    count_nodes(count, stack_out)
-    count_nodes(count, effects)
+    while True:
 
-    stack = stack_in
-    schedule
+        break
+
+    return schedule
