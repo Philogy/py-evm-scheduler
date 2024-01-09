@@ -1,26 +1,31 @@
-from typing import Iterable, Iterator, Optional, Sequence
+from typing import Iterable, TypeVar, Iterator, Optional, Sequence, Generic
 from attrs import frozen
-from .node import Node
 
 
 MAX_VALID_SWAP_DEPTH = 16
 
 
+T = TypeVar('T')
+
+
 @frozen
-class Stack:
-    values: tuple[Node, ...]
+class Stack(Generic[T]):
+    values: tuple[T, ...]
 
     def __len__(self) -> int:
         return len(self.values)
 
-    def __iter__(self) -> Iterator[Node]:
+    def __iter__(self) -> Iterator[T]:
         return iter(self.values)
 
     def __repr__(self) -> str:
         return repr(list(self.values))
 
-    def peek(self) -> Node:
-        return self.values[-1]
+    def peek(self) -> Optional[T]:
+        if self.values:
+            return self.values[-1]
+        else:
+            return None
 
     def swap(self, depth: int) -> tuple['Stack', str]:
         assert depth in range(
@@ -31,32 +36,37 @@ class Stack:
         values[-1], values[-depth-1] = values[-depth-1], values[-1]
         return Stack(tuple(values)), f'swap{depth}'
 
-    def count(self, node: Node) -> int:
-        return sum(
-            value == node
-            for value in self.values
-        )
+    def count(self, node: T, max_count: int = 1024) -> int:
+        count = 0
 
-    def push_operands_onto(self, node: Node) -> 'Stack':
-        '''
-            call_params: gas, addr, val, cd_start, cd_len, ret_start, ret_len
-        '''
+        for value in self.values:
+            if value == node:
+                count += 1
+                if count >= max_count:
+                    return max_count
+
+        return count
+
+    def tail(self) -> Sequence[T]:
+        return self.values[:-1]
+
+    def push_onto(self, rev_values: Iterable[T]) -> 'Stack':
         new_values = self.values
-        for value in reversed(node.operands):
+        for value in rev_values:
             new_values += (value,)
         return Stack(new_values)
 
-    def push(self, value: Node) -> 'Stack':
+    def push(self, value: T) -> 'Stack':
         return Stack(self.values + (value,))
 
-    def get(self, depth: int) -> Node:
+    def get(self, depth: int) -> T:
         assert depth in range(len(self.values))
         return self.values[-depth - 1]
 
-    def pop(self) -> tuple['Stack', Node]:
+    def pop(self) -> tuple['Stack', T]:
         return Stack(self.values[:-1]), self.values[-1]
 
-    def swap_to_top(self, value: Node) -> tuple['Stack', Optional[str]]:
+    def swap_to_top(self, value: T) -> tuple['Stack[T]', Optional[str]]:
         if self.values[-1] == value:
             return self, None
         i = self.values.index(value)

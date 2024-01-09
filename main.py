@@ -1,61 +1,127 @@
-from scheduler.node import Node
-from scheduler.schedule import Scheduler, node_post_effects
+from scheduler.node import enode, const
+from scheduler.dijkstra import DijkstraSchedule
+import sys
+import cProfile
 
 
-def _erc20_example():
-    # frm = Node('calldataload', Node.lit('0x04'), alias='from')
-    # to = Node('calldataload', Node.lit('0x24'), alias='to')
-    # amt = Node('calldataload', Node.lit('0x44'), alias='amount')
-    frm = Node.lit('frm')
-    to = Node.lit('to')
-    amt = Node.lit('amt')
-    dispatch_error = Node.lit('dispatch_error')
+def _erc20_example() -> DijkstraSchedule:
+    frm = enode('calldataload', const('0x04'))
+    to = enode('calldataload', const('0x24'))
+    amt = enode('calldataload', const('0x44'))
+    error = enode('error')
 
-    from_bal = node_post_effects('sload', frm, effects=[])
-    new_from_bal = Node('sub', from_bal, amt)
-    from_bal_update = Node('sstore', frm, new_from_bal)
+    from_bal = enode('sload', frm, post=[])
+    new_from_bal = enode('sub', from_bal, amt)
 
-    to_bal = node_post_effects('sload', to, effects=[from_bal_update])
-    new_to_bal = Node('add', to_bal, amt)
-    to_bal_update = Node('sstore', to, new_to_bal)
+    assert new_from_bal.has_dependency(amt.node)
 
-    from_bal_too_small = Node('gt', amt, from_bal)
-    updated_error = Node('or', dispatch_error, from_bal_too_small)
-    combined_assert = Node('assertFalse', updated_error)
+    from_bal_update = enode('sstore', frm, new_from_bal)
 
-    scheduler = Scheduler(
-        [dispatch_error.name],
-        [],
-        [to_bal_update, combined_assert]
+    to_bal = enode('sload', to, post=[from_bal_update])
+    new_to_bal = enode('add', to_bal, amt)
+    to_bal_update = enode('sstore', to, new_to_bal)
+
+    from_bal_too_small = enode('gt', amt, from_bal)
+    updated_error = enode('or', from_bal_too_small, error)
+    combined_assert = enode('assertFalse', updated_error)
+
+    # store_amt = enode('mstore', const('zero'), amt)
+    # log = enode('log3', const('zero'), const('msize'),
+    #             const('transfer_event_sig'), frm, to, post=[store_amt])
+
+    store_one = enode('mstore', const('zero'), const('0x01'),
+                      post=[combined_assert, to_bal_update])
+    return_one = enode(
+        'return',
+        const('zero'),
+        const('msize'),
+        post=[store_one]
     )
 
-    print(f'scheduler.best_solution: {scheduler.best_solution}')
+    return DijkstraSchedule(
+        [error.name],
+        [],
+        [return_one],
+    )
+
+
+def _existing_vars_op_example() -> DijkstraSchedule:
+    a, b, c, d = map(enode, 'abcd')
+    mstore = enode('mstore', a, b)
+    pop_c = enode('pop', c)
+
+    return DijkstraSchedule(
+        [*'abcd'],
+        [a, b, d],
+        [mstore, pop_c]
+    )
+
+
+def _simple_store() -> DijkstraSchedule:
+    to = enode('to')
+    mod = enode('mod', to)
+    store = enode('store', to, mod)
+
+    return DijkstraSchedule(
+        [],
+        [],
+        [store]
+    )
+
+
+def _weth_withdraw_example() -> DijkstraSchedule:
+    frm = const('caller')
+    to = enode('calldataload', const('0x04'))
+    amt = enode('calldataload', const('0x24'))
+    error = enode('error')
+
+    bal = enode('sload', frm)
+    new_bal = enode('sub', bal, amt)
+    update_bal = enode('sstore', frm, new_bal)
+
+    updated_error = enode('or', error, enode('gt', amt, bal))
+    check_error = enode('assertFalse', updated_error)
+
+    suc = enode(
+        'call',
+        const('gas'),
+        to,
+        amt,
+        const('zero'),
+        const('zero'),
+        const('zero'),
+        const('zero'),
+        post=[check_error, update_bal]
+    )
+
+    bubble = enode('bubble_revert', suc)
+
+    end = enode('stop', post=[bubble])
+
+    return DijkstraSchedule(
+        [error.name],
+        [],
+        [end]
+    )
 
 
 def main():
-    _erc20_example()
+    scheduler = _erc20_example()
+    # scheduler = _weth_withdraw_example()
+    # scheduler = _existing_vars_op_example()
+    # scheduler = _simple_store()
+
+    assert scheduler.solution, f'No solutions'
+
+    print(f'weight: {scheduler.best_weight}')
+    print(f'input stack: {scheduler.target_input_symbols}\n')
+
+    for solution in scheduler.solution:
+        print(solution)
 
 
 if __name__ == '__main__':
-    main()
-
-'''
-amt             | amt
-frm             | amt frm
-dup1            | amt frm frm
-sload           | amt frm frm_bal
-dup3            | amt frm frm_bal amt
-to              | amt frm frm_bal amt to
-dup5            | amt frm frm_bal amt to amt
-dup4            | amt frm frm_bal amt to amt frm_bal
-sub             | amt frm frm_bal amt to frm_bal'
-dup2            | amt frm frm_bal amt to frm_bal' to
-swap5           | amt to frm_bal amt to frm_bal' frm
-sstore          | amt to frm_bal amt to
-sload           | amt to frm_bal amt to_bal
-add             | amt to frm_bal to_bal'
-swap3           | to_bal' to frm_bal amt
-gt              | to_bal' to bal_too_small
-assertFalse     | to_bal' to
-sstore          | -
-'''
+    if '--profile' in sys.argv:
+        cProfile.run('main()', sort='cumtime')
+    else:
+        main()

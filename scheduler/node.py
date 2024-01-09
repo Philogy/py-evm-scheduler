@@ -1,67 +1,84 @@
 from typing import Optional
-from attrs import frozen, field
+from functools import cache
 
 
-@frozen
 class Node:
     name: str
-    operands: tuple['Node', ...]
-    alias: Optional[str]
-    depth: int = field()
-    commutative: bool = False
+    operands: tuple['EffectfulNode', ...]
+    is_constant: bool
+    dependencies: set['Node']
+    __cached_hash: int
 
-    def __init__(self, name: str, *operands: 'Node', alias: Optional[str] = None, commutative: bool = False) -> None:
-        if operands:
-            depth = max(op.depth for op in operands) + 1
-        else:
-            depth = 0
-        self.__attrs_init__(
-            name,
-            operands,
-            alias,
-            depth,
-            commutative
-        )
+    def __init__(
+        self,
+        name: str,
+        *operands: 'EffectfulNode',
+        is_constant: bool = False,
+    ) -> None:
+        self.name = name
+        self.operands = operands
+        self.is_constant = is_constant
 
-    @classmethod
-    def lit(cls, name: str) -> 'Node':
-        return Node(name, alias=name)
+        self.dependencies = set()
+        for operand in operands:
+            self.dependencies.add(operand.node)
+            self.dependencies.update(operand.dependencies)
 
-    MULTILINE_THRESHOLD = 30
-    SPACE_PER_INDENT_LEVEL = 2
+        self.__cached_hash = hash((self.name, self.operands, self.is_constant))
 
-    def _repr(self, depth: int) -> str:
-        if self.alias is not None:
-            return f'{self.alias}[{self.depth}]'
-
-        total_op_repr_len = sum(map(
-            lambda op: len(op._repr(0)),
-            self.operands
-        ))
-
-        base_indent = ' ' * self.SPACE_PER_INDENT_LEVEL
-        outer_indent = base_indent * depth
-        inner_indent = base_indent * (depth + 1)
-
-        header = f'{self.name}[{self.depth}]'
-        if total_op_repr_len >= self.MULTILINE_THRESHOLD:
-            return f'{header}(\n'\
-                + inner_indent + f',\n{inner_indent}'.join(map(lambda op: op._repr(depth + 1), self.operands))\
-                + f'\n{outer_indent})'
-        else:
-            return f'{header}({", ".join(map(str, self.operands))})'
-
-    def __repr__(self) -> str:
-        return self._repr(0)
+    def __hash__(self) -> int:
+        return self.__cached_hash
 
     def has_dependency(self, dependency: 'Node') -> bool:
-        return self.depth > dependency.depth and (
-            any(
-                operand == dependency or
-                operand.has_dependency(dependency)
-                for operand in self.operands
-            )
-        )
+        return dependency in self.dependencies
+
+
+class EffectfulNode:
+    node: Node
+    post_effects: tuple['EffectfulNode', ...] = tuple()
+    dependencies: set['Node']
+    __cached_hash: int
+
+    def __init__(self, node: Node, post_effects: tuple['EffectfulNode', ...] = tuple()) -> None:
+        self.node = node
+        self.post_effects = post_effects
+        self.dependencies = node.dependencies.copy()
+        for effect in post_effects:
+            self.dependencies.update(effect.dependencies)
+        self.__cached_hash = hash((self.node, self.post_effects))
+
+    def __hash__(self) -> int:
+        return self.__cached_hash
+
+    @property
+    def name(self) -> str:
+        return self.node.name
+
+    @property
+    def is_constant(self) -> bool:
+        return self.node.is_constant
+
+    @cache
+    def has_dependency(self, dependency: 'Node') -> bool:
+        return dependency in self.dependencies
+
+
+def enode(name: str, *operands, post: Optional[list[EffectfulNode]] = None, is_constant=False) -> EffectfulNode:
+    if post is None:
+        post = []
+
+    return EffectfulNode(
+        Node(
+            name,
+            *operands,
+            is_constant=is_constant
+        ),
+        post_effects=tuple(post)
+    )
+
+
+def const(name: str) -> EffectfulNode:
+    return enode(name, is_constant=True)
 
 
 class DuplicateNodeError(Exception):

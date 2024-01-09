@@ -1,21 +1,10 @@
 from collections import Counter
 from typing import Generator, Optional, Sequence
-from attrs import define, frozen
+from attrs import frozen
 from .node import Node
 from .stack import Stack
 from .logging import log
 from .swap import get_swaps
-
-
-@define
-class Solution:
-    weight: int
-    steps: list[str]
-
-
-@define
-class Action:
-    pass
 
 
 Trace = tuple[str, ...]
@@ -27,15 +16,15 @@ EFFECT_WRAPPER_NODE = '__effect__'
 @frozen
 class SearchState:
     stack: Stack
-    effects_to_undo: frozenset[Node]
+    effects_to_undo: tuple[Node, ...]
     trace: Trace = tuple()
     weight: int = 0
 
     def undo_effect(self, effect: Node) -> 'SearchState':
-        new_effects = set(self.effects_to_undo)
 
-        assert effect in new_effects
-        new_effects.remove(effect)
+        assert effect in self.effects_to_undo
+        i = self.effects_to_undo.index(effect)
+        new_effects = self.effects_to_undo[:i] + self.effects_to_undo[i+1:]
 
         return self._undo_node(
             self.stack,
@@ -46,7 +35,7 @@ class SearchState:
         )
 
     def has_dependency(self, node: Node) -> bool:
-        return any(
+        return not node.is_constant and any(
             value.has_dependency(node)
             for value in self.stack
         ) or any(
@@ -63,21 +52,20 @@ class SearchState:
             weight += 1
         stack, value = stack.pop()
         assert value == node
-        return self._undo_node(stack, set(self.effects_to_undo), trace, weight, node)
+        return self._undo_node(stack, self.effects_to_undo, trace, weight, node)
 
-    def dedup(self, value: Node, i: int) -> 'SearchState':
-        top_index = len(self.stack) - 1
+    def dedup(self, value: Node, depth: int) -> 'SearchState':
+        log.debug(f'Deduping {value} ({depth}) from {self.stack.values}')
         stack = self.stack
         trace = self.trace
         weight = self.weight
-        if i != top_index:
-            depth = top_index - i
+        if depth != 0:
             stack, op = stack.swap(depth)
             trace += (op,)
             weight += 1
         # TODO: Dedup based on first index within 16 range
         dedup_index = stack.values.index(value)
-        assert dedup_index != top_index
+        assert dedup_index != len(self.stack) - 1
         stack, popped_value = stack.pop()
         assert popped_value == value
         dup_depth = len(stack) - dedup_index
@@ -95,7 +83,7 @@ class SearchState:
     def _undo_node(
         cls,
         stack: Stack,
-        effects_to_undo: set[Node],
+        effects_to_undo: tuple[Node, ...],
         trace: Trace,
         weight: int,
         node: Node
@@ -105,12 +93,9 @@ class SearchState:
             stack, top = stack.pop()
             for new_effect in top.operands:
                 assert new_effect not in effects_to_undo
-                effects_to_undo.add(new_effect)
+                effects_to_undo += (new_effect,)
         trace += (node.name,)
-        return SearchState(stack, frozenset(effects_to_undo), trace, weight)
-
-
-MAX_WEIGHT = 10
+        return SearchState(stack, effects_to_undo, trace, weight)
 
 
 def node_post_effects(name: str, *operands: Node, effects: Optional[Sequence[Node]] = None) -> Node:
@@ -123,13 +108,16 @@ class Scheduler:
     target_input_symbols: list[str]
     input_value_counts: Counter[str]
     input_value_counts_frozen: frozenset[tuple[str, int]]
-    best_solution: Optional[Solution] = None
+    best_weight: Optional[int] = None
+    best_solutions: list[list[str]]
+    optimum_upper_bound: Optional[int]
 
     def __init__(
         self,
         target_input_symbols: list[str],
         start_output_stack: list[Node],
-        start_done_effects: list[Node]
+        start_done_effects: list[Node],
+        optimum_upper_bound: Optional[int]
     ) -> None:
         # TODO: Validate no target symbols in effects or output stack nodes
 
@@ -138,10 +126,12 @@ class Scheduler:
         self.input_value_counts_frozen = frozenset(
             self.input_value_counts.items()
         )
+        self.best_solutions = []
+        self.optimum_upper_bound = optimum_upper_bound
 
         self.search(SearchState(
             Stack(tuple(start_output_stack)),
-            frozenset(start_done_effects)
+            tuple(start_done_effects)
         ))
 
     def search(self, state: SearchState):
@@ -151,17 +141,20 @@ class Scheduler:
             self.complete_and_record(state)
             return
 
-        for state in self.next_states(state):
-            try:
-                self.search(state)
-            except RecursionError:
-                log.error(
-                    f'received recursion error (final state: {state})'
-                )
-                raise Exception('caught recursion error')
+        for new_state in self.next_states(state):
+            if new_state is not None:
+                self.search(new_state)
 
-    def next_states(self, state: SearchState) -> Generator[SearchState, None, None]:
+    def next_states(self, state: SearchState) -> Generator[Optional[SearchState], None, None]:
         log.debug(f'Getting next states from: {state}')
+
+        if self.is_optimal():
+            return
+
+        # Undo dup top of stack
+        if (top := state.stack.peek()) is not None:
+            yield self.undo_dup(state, top, 0)
+            yield self.undo_node(state, top)
 
         # Undo Effect
         for effect in state.effects_to_undo:
@@ -169,31 +162,39 @@ class Scheduler:
             yield state.undo_effect(effect)
 
         # Undo Node
-        for value in state.stack:
-            if value.name in self.target_input_symbols:
-                continue
-            if state.stack.count(value) > 1:
-                continue
-            if state.has_dependency(value):
-                continue
-            log.debug(f'undoing node {value}')
-            yield state.undo_node(value)
+        for value in state.stack.tail():
+            yield self.undo_node(state, value)
 
         # Undo Dup
-        for i, value in enumerate(state.stack):
-            count = state.stack.count(value)
-            if count == 1:
-                # log.debug(f'No values to dedup for {value} at {i}')
-                continue
-            if self.input_value_counts[value.name] >= count:
-                continue
-            if state.has_dependency(value):
-                continue
-            log.debug(f'deduping {value} at index {i}')
-            yield state.dedup(value, i)
+        for depth, node in enumerate(reversed(state.stack.tail()), start=1):
+            if (next_state := self.undo_dup(state, node, depth)) is not None:
+                yield next_state
 
         log.debug(f'End of next states')
         # TODO: pops
+
+    def undo_node(self, state: SearchState, value: Node) -> Optional[SearchState]:
+        if value.name in self.target_input_symbols:
+            return None
+        if not value.is_constant and state.stack.count(value) > 1:
+            return None
+        if state.has_dependency(value):
+            return None
+        log.debug(f'undoing node {value}')
+        return state.undo_node(value)
+
+    def undo_dup(self, state: SearchState, node: Node, depth: int) -> Optional[SearchState]:
+        if node.is_constant:
+            return None
+        count = state.stack.count(node)
+        if count == 1:
+            return None
+        if self.input_value_counts[node.name] >= count:
+            return None
+        if state.has_dependency(node):
+            return None
+        log.debug(f'deduping {node} at depth {depth}')
+        return state.dedup(node, depth)
 
     def found_input(self, state: SearchState) -> bool:
         if state.effects_to_undo or len(state.stack) != len(self.target_input_symbols):
@@ -205,6 +206,11 @@ class Scheduler:
         ))
 
         return frozenset(state_value_counts.items()) == self.input_value_counts_frozen
+
+    def is_optimal(self) -> bool:
+        return self.optimum_upper_bound is not None\
+            and self.best_weight is not None\
+            and self.best_weight <= self.optimum_upper_bound
 
     def complete_and_record(self, state: SearchState):
         weight = state.weight
@@ -219,11 +225,16 @@ class Scheduler:
 
         steps.extend(state.trace[::-1])
 
-        solution = Solution(weight, steps)
-        if self.best_solution is None:
-            log.info(f'Found first solution ({solution})')
+        if self.best_weight is None or self.best_weight > weight:
+            self.best_weight = weight
+            self.best_solutions = [steps]
+        else:
+            assert self.best_weight == weight
+            self.best_solutions.append(steps)
 
-        self.best_solution = solution
+        log.info(
+            f'New solution (weight: {weight},)\n  steps: {" ".join(steps)}'
+        )
 
     def weight_better(self, weight: int) -> bool:
-        return (self.best_solution is None or self.best_solution.weight > weight) and weight <= MAX_WEIGHT
+        return self.best_weight is None or self.best_weight > weight
